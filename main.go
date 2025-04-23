@@ -13,8 +13,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// Models
-
 type User struct {
 	ID           uint      `gorm:"primaryKey" json:"id"`
 	Email        string    `gorm:"unique;not null" json:"email"`
@@ -64,54 +62,48 @@ type Application struct {
 	CoverLetter string    `json:"cover_letter"`
 }
 
-// JWT secret
 var jwtSecret = []byte(getEnv("JWT_SECRET", "supersecretkey"))
 var db *gorm.DB
 
 func main() {
-	// Database connection
+
 	dsn := getEnv("DB_DSN", "slime:warui_slime#6979@tcp(127.0.0.1:3306)/jobportal?charset=utf8mb4&parseTime=True&loc=Local")
 	var err error
 	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	// Migrate schema
+
 	db.AutoMigrate(&User{}, &Employee{}, &Employer{}, &Job{}, &Application{})
 
 	r := gin.Default()
-	// CORS for frontend
+
 	r.Use(corsMiddleware())
 
-	// Public routes
 	r.POST("/signup", signupHandler)
 	r.POST("/login", loginHandler)
 	r.GET("/health", healthHandler)
 
-	// Protected
 	auth := r.Group("/")
 	auth.Use(authMiddleware())
 	auth.GET("/profile", profileHandler)
 
-	// Employee routes
 	emp := auth.Group("/employee")
 	emp.Use(roleMiddleware("employee"))
-	emp.GET("/jobs", listJobsForEmployee)                 // GET /employee/jobs
-	emp.POST("/applications", applyJobHandler)            // POST /employee/applications
-	emp.GET("/applications", listApplicationsForEmployee) // GET /employee/applications
+	emp.GET("/jobs", listJobsForEmployee)
+	emp.POST("/applications", applyJobHandler)
+	emp.GET("/applications", listApplicationsForEmployee)
 
 	// Employer routes
 	er := auth.Group("/employer")
 	er.Use(roleMiddleware("employer"))
-	er.POST("/jobs", createJobHandler)                   // POST /employer/jobs
-	er.GET("/jobs", listJobsForEmployer)                 // GET /employer/jobs
-	er.GET("/applications", listApplicationsForEmployer) // GET /employer/applications
+	er.POST("/jobs", createJobHandler)
+	er.GET("/jobs", listJobsForEmployer)
+	er.GET("/applications", listApplicationsForEmployer)
 
 	log.Println("Server started on :8080")
 	r.Run(":8080")
 }
-
-// Handlers and middleware
 
 func signupHandler(c *gin.Context) {
 	var input struct{ Email, Password, Role string }
@@ -149,7 +141,6 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Create JWT
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub":  user.ID,
 		"role": user.Role,
@@ -162,10 +153,8 @@ func loginHandler(c *gin.Context) {
 		return
 	}
 
-	// Set cookie
 	c.SetCookie("jwt", tkn, 3600*24, "/", "", false, true)
 
-	// Send response with role
 	c.JSON(http.StatusOK, gin.H{
 		"message": "logged in",
 		"role":    user.Role,
@@ -173,25 +162,22 @@ func loginHandler(c *gin.Context) {
 }
 
 func profileHandler(c *gin.Context) {
-	// user_id and role were set in authMiddleware
+
 	userID := c.GetUint("user_id")
 	role := c.GetString("role")
 
-	// fetch basic user info
 	var user User
 	if err := db.First(&user, userID).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not fetch user"})
 		return
 	}
 
-	// build response
 	resp := gin.H{
 		"id":    user.ID,
 		"email": user.Email,
 		"role":  role,
 	}
 
-	// optionally include profile fields
 	switch role {
 	case "employee":
 		var emp Employee
@@ -222,13 +208,11 @@ func healthHandler(c *gin.Context) {
 func listJobsForEmployee(c *gin.Context) {
 	var jobs []Job
 
-	// Fetch all jobs without filtering by expiry
 	if err := db.Find(&jobs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not fetch jobs", "details": err.Error()})
 		return
 	}
 
-	// Check if there are no jobs
 	if len(jobs) == 0 {
 		c.JSON(http.StatusOK, gin.H{"message": "No available jobs"})
 		return
@@ -247,7 +231,6 @@ func applyJobHandler(c *gin.Context) {
 		return
 	}
 
-	// Verify job exists
 	var job Job
 	if err := db.First(&job, input.JobID).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "job not found"})

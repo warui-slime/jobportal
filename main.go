@@ -51,6 +51,7 @@ type Job struct {
 	PostedAt       time.Time     `gorm:"autoCreateTime" json:"posted_at"`
 	ExpiresAt      time.Time     `json:"expires_at"`
 	Applications   []Application `gorm:"foreignKey:JobID" json:"applications,omitempty"`
+	Employer       Employer      `gorm:"foreignKey:EmployerID" json:"employer"`
 }
 
 type Application struct {
@@ -60,6 +61,23 @@ type Application struct {
 	AppliedAt   time.Time `gorm:"autoCreateTime" json:"applied_at"`
 	Status      string    `gorm:"type:ENUM('pending','accepted','rejected');not null" json:"status"`
 	CoverLetter string    `json:"cover_letter"`
+
+	Employee Employee `gorm:"foreignKey:EmployeeID" json:"employee"`
+	Job      Job      `gorm:"foreignKey:JobID" json:"job"`
+}
+
+type SignupInput struct {
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required"`
+	Role     string `json:"role" binding:"required,oneof=employer employee"`
+
+	CompanyName    string `json:"company_name,omitempty"`
+	CompanyAddress string `json:"company_address,omitempty"`
+	Phone          string `json:"phone,omitempty"`
+
+	FirstName string    `json:"first_name,omitempty"`
+	LastName  string    `json:"last_name,omitempty"`
+	DOB       time.Time `json:"date_of_birth,omitempty" time_format:"2006-01-02"`
 }
 
 var jwtSecret = []byte(getEnv("JWT_SECRET", "supersecretkey"))
@@ -83,9 +101,10 @@ func main() {
 	r.POST("/signup", signupHandler)
 	r.POST("/login", loginHandler)
 	r.GET("/health", healthHandler)
+	r.POST("/logout", logoutHandler)
 
 	auth := r.Group("/")
-	auth.Use(authMiddleware())
+	auth.Use(authMiddleware(), profileCompleteMiddleware())
 	auth.GET("/profile", profileHandler)
 
 	emp := auth.Group("/employee")
@@ -93,6 +112,8 @@ func main() {
 	emp.GET("/jobs", listJobsForEmployee)
 	emp.POST("/applications", applyJobHandler)
 	emp.GET("/applications", listApplicationsForEmployee)
+	emp.PATCH("/profile", updateEmployeeProfile)
+	emp.GET("/profile", getEmployeeProfileHandler)
 
 	// Employer routes
 	er := auth.Group("/employer")
@@ -100,24 +121,83 @@ func main() {
 	er.POST("/jobs", createJobHandler)
 	er.GET("/jobs", listJobsForEmployer)
 	er.GET("/applications", listApplicationsForEmployer)
+	er.PATCH("/profile", updateEmployerProfile)
 
 	log.Println("Server started on :8080")
 	r.Run(":8080")
 }
 
 func signupHandler(c *gin.Context) {
-	var input struct{ Email, Password, Role string }
+	var input SignupInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	pw, _ := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
-	user := User{Email: input.Email, PasswordHash: string(pw), Role: input.Role}
-	if err := db.Create(&user).Error; err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+
+	if input.Role == "employer" && input.CompanyName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "company_name is required for employers"})
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"id": user.ID, "email": user.Email, "role": user.Role})
+
+	if input.Role == "employee" && (input.FirstName == "" || input.LastName == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "first_name and last_name are required for employees"})
+		return
+	}
+
+	tx := db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	pwHash, _ := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	user := User{
+		Email:        input.Email,
+		PasswordHash: string(pwHash),
+		Role:         input.Role,
+	}
+
+	if err := tx.Create(&user).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusConflict, gin.H{"error": "email already exists"})
+		return
+	}
+
+	switch input.Role {
+	case "employer":
+		employer := Employer{
+			UserID:         user.ID,
+			CompanyName:    input.CompanyName,
+			CompanyAddress: input.CompanyAddress,
+			Phone:          input.Phone,
+		}
+		if err := tx.Create(&employer).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create employer profile"})
+			return
+		}
+
+	case "employee":
+		employee := Employee{
+			UserID:    user.ID,
+			FirstName: input.FirstName,
+			LastName:  input.LastName,
+			DOB:       input.DOB,
+		}
+		if err := tx.Create(&employee).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create employee profile"})
+			return
+		}
+	}
+
+	tx.Commit()
+	c.JSON(http.StatusCreated, gin.H{
+		"id":    user.ID,
+		"email": user.Email,
+		"role":  user.Role,
+	})
 }
 
 func loginHandler(c *gin.Context) {
@@ -161,6 +241,29 @@ func loginHandler(c *gin.Context) {
 	})
 }
 
+func profileCompleteMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := c.GetUint("user_id")
+		role := c.GetString("role")
+
+		var count int64
+		switch role {
+		case "employer":
+			db.Model(&Employer{}).Where("user_id = ?", userID).Count(&count)
+		case "employee":
+			db.Model(&Employee{}).Where("user_id = ?", userID).Count(&count)
+		}
+
+		if count == 0 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "profile not complete"})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
 func profileHandler(c *gin.Context) {
 
 	userID := c.GetUint("user_id")
@@ -200,9 +303,88 @@ func profileHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, resp)
 }
+func updateEmployeeProfile(c *gin.Context) {
+	userID := c.GetUint("user_id")
+	var input struct {
+		FirstName string    `json:"first_name"`
+		LastName  string    `json:"last_name"`
+		DOB       time.Time `json:"date_of_birth" time_format:"2006-01-02"`
+		ResumeURL string    `json:"resume_url"`
+	}
 
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var employee Employee
+	if err := db.Where("user_id = ?", userID).First(&employee).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "profile not found"})
+		return
+	}
+
+	employee.FirstName = input.FirstName
+	employee.LastName = input.LastName
+	employee.DOB = input.DOB
+	employee.ResumeURL = input.ResumeURL
+
+	if err := db.Save(&employee).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update profile"})
+		return
+	}
+
+	c.JSON(http.StatusOK, employee)
+}
+
+func updateEmployerProfile(c *gin.Context) {
+	userID := c.GetUint("user_id")
+	var input struct {
+		CompanyName    string `json:"company_name"`
+		CompanyAddress string `json:"company_address"`
+		Phone          string `json:"phone"`
+		WebsiteURL     string `json:"website_url"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var employer Employer
+	if err := db.Where("user_id = ?", userID).First(&employer).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "profile not found"})
+		return
+	}
+
+	employer.CompanyName = input.CompanyName
+	employer.CompanyAddress = input.CompanyAddress
+	employer.Phone = input.Phone
+	employer.WebsiteURL = input.WebsiteURL
+
+	if err := db.Save(&employer).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update profile"})
+		return
+	}
+
+	c.JSON(http.StatusOK, employer)
+}
+
+func getEmployeeProfileHandler(c *gin.Context) {
+	empID := c.GetUint("user_id")
+	var employee Employee
+
+	db.Where("user_id = ?", empID).First(&employee)
+
+	c.JSON(http.StatusOK, employee)
+}
 func healthHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func logoutHandler(c *gin.Context) {
+	c.SetCookie("jwt", "", -1, "/", "", false, true)
+	c.SetCookie("token", "", -1, "/", "", false, true)
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
 }
 
 func listJobsForEmployee(c *gin.Context) {
@@ -254,8 +436,18 @@ func applyJobHandler(c *gin.Context) {
 
 func listApplicationsForEmployee(c *gin.Context) {
 	empID := c.GetUint("user_id")
-	var apps []Application
-	db.Where("employee_id = ?", empID).Find(&apps)
+	var apps []struct {
+		Application
+		JobTitle    string `json:"job_title"`
+		CompanyName string `json:"company_name"`
+	}
+	db.Table("applications").
+		Select("applications.*, jobs.title as job_title, employers.company_name").
+		Joins("JOIN jobs ON jobs.id = applications.job_id").
+		Joins("JOIN employers ON employers.id = jobs.employer_id").
+		Where("applications.employee_id = ?", empID).
+		Find(&apps)
+
 	c.JSON(http.StatusOK, apps)
 }
 
@@ -285,7 +477,14 @@ func listJobsForEmployer(c *gin.Context) {
 func listApplicationsForEmployer(c *gin.Context) {
 	emID := c.GetUint("user_id")
 	var apps []Application
-	db.Joins("JOIN jobs ON jobs.id = applications.job_id").Where("jobs.employer_id = ?", emID).Find(&apps)
+
+	db.Preload("Employee").
+		Preload("Job").
+		Preload("Job.Employer").
+		Joins("JOIN jobs ON jobs.id = applications.job_id").
+		Where("jobs.employer_id = ?", emID).
+		Find(&apps)
+
 	c.JSON(http.StatusOK, apps)
 }
 
@@ -294,7 +493,7 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", getEnv("FRONTEND_ORIGIN", "http://localhost:3000"))
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization")
-		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "GET,POST,OPTIONS,PUT,UPDATE")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return

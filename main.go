@@ -289,8 +289,6 @@ func listApplicationsForEmployer(c *gin.Context) {
 	c.JSON(http.StatusOK, apps)
 }
 
-// Middleware
-
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", getEnv("FRONTEND_ORIGIN", "http://localhost:3000"))
